@@ -1,0 +1,12 @@
+# cordis.patch.yml 登记模板
+# 复制条目到实际文件：
+#   DSH Desktop: %APPDATA%\DSH Desktop\dsh-home\profiles\web\cordis.patch.yml
+#   命令行 dsh:  ~/.dsh/profiles/web/cordis.patch.yml
+#
+# 使用 ?v=N query 版本号避开 ESM 模块缓存：
+# 修改 session-cleaner.plugin.mjs 后把 ?v=1 改成 ?v=2 保存即触发热加载。
+- insert:
+    - id: session-cleaner
+      name: ./session-cleaner.plugin.mjs?v=1
+      config:
+        verbose: false
