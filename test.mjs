@@ -1,5 +1,5 @@
 /**
- * test.mjs — session-cleaner 宿主插件独立单元与集成测试脚本
+ * test.mjs — session-cleaner 宿主插件独立单元与集成测试脚本 (v1.1.0)
  *
  * 测试目标：
  * 1. 同名重名任务误删防护断言：删除目标 ID 时，同名的其它会话及其注册项原封不动
@@ -10,6 +10,8 @@
  * 6. 粉碎断言：purge 彻底移除
  * 7. Cordis 插件生命周期与路由注册/卸载断言
  * 8. 前端注入脚本文本包含 _menuOpen 与 #trash
+ * 9. [1.1.0 新增] extractSessionPreview 功能断言 (明文 .jsonl、多帧 .zstd 解压、系统/插件消息过滤)
+ * 10. [1.1.0 新增] GET /api/session-cleaner/preview 路由断言 (sessions 与 trash 来源区分、400 失败处理)
  */
 
 import { existsSync } from 'node:fs'
@@ -17,6 +19,7 @@ import { mkdir as mkdirP, readFile as readText, rm as rmDir, writeFile as writeT
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
+import { zstdCompressSync } from 'node:zlib'
 
 // 导入待测组件：与本脚本同目录的插件源码（本仓库即为插件正本）。
 const pluginPath = resolve(import.meta.dirname, 'session-cleaner.plugin.mjs')
@@ -25,7 +28,7 @@ if (!existsSync(pluginPath)) {
   process.exit(1)
 }
 const pluginModule = await import(pathToFileURL(pluginPath).href)
-const { projectKey, encodeSegment, listSessions, listTrash, moveToTrash, restoreFromTrash, purgeTrash, apply } = pluginModule
+const { projectKey, encodeSegment, listSessions, listTrash, moveToTrash, restoreFromTrash, purgeTrash, extractSessionPreview, apply } = pluginModule
 
 let passes = 0
 let fails = 0
@@ -52,7 +55,7 @@ async function readJson(filePath) {
 
 async function runTests() {
   console.log('====================================================')
-  console.log(' 正在测试 session-cleaner 宿主插件...')
+  console.log(' 正在测试 session-cleaner 宿主插件 (v1.1.0)...')
   console.log('====================================================\n')
 
   // 构造临时测试根目录 (%TEMP%\test-session-cleaner-xxxx)
@@ -203,7 +206,6 @@ async function runTests() {
   let effectDisposer = null
   const registeredRoutes = new Map()
   const injectListeners = []
-  const injectedRows = []
 
   const mockWs = {
     register: (route) => {
@@ -232,34 +234,141 @@ async function runTests() {
     },
   }
 
-  apply(mockCtx, { verbose: false })
+  apply(mockCtx, { dshHome: testRoot, verbose: false })
 
   assert(registeredRoutes.has('/api/session-cleaner/sessions'), '成功注册路由 /api/session-cleaner/sessions')
+  assert(registeredRoutes.has('/api/session-cleaner/preview'), '成功注册新增路由 /api/session-cleaner/preview')
   assert(registeredRoutes.has('/api/session-cleaner/delete'), '成功注册路由 /api/session-cleaner/delete')
   assert(registeredRoutes.has('/session-cleaner'), '成功注册管理页路由 /session-cleaner')
 
-  // 真实 webServer 以 route.handler(req,res) 派发；属性名不匹配会得到空 400
   for (const route of registeredRoutes.values()) {
-    assert(typeof route.handler === 'function', `路由 ${route.path} 以 route.handler 暴露处理函数（真实 webServer 派发契约）`)
+    assert(typeof route.handler === 'function', `路由 ${route.path} 以 route.handler 暴露处理函数`)
   }
 
-  // 模拟一次 index 渲染：触发 webserver/index-inject 事件并校验结构化注入行
   class MockInjectedRows {
     constructor() { this.items = []; }
     add(item) { this.items.push(item); }
+    push(item) { this.items.push(item); }
   }
-  const mockInj = new MockInjectedRows();
-  for (const listener of injectListeners) listener(mockInj);
+  const mockInj = new MockInjectedRows()
+  for (const listener of injectListeners) listener(mockInj)
 
-  const scriptRow = mockInj.items.find((r) => r.kind === 'script' && r.placement === 'body');
-  assert(Boolean(scriptRow), 'webserver/index-inject 事件提交了前端入口脚本行');
-  assert(scriptRow && scriptRow.text.includes('_menuOpen'), '前端注入脚本包含 _menuOpen 选择器定义');
-  assert(scriptRow && scriptRow.text.includes('#trash'), '前端注入脚本包含 #trash 路由逻辑');
+  const scriptRow = mockInj.items.find((r) => r.kind === 'script' && r.placement === 'body')
+  assert(Boolean(scriptRow), 'webserver/index-inject 事件提交了前端入口脚本行')
+  assert(scriptRow && scriptRow.text.includes('_menuOpen'), '前端注入脚本包含 _menuOpen 选择器定义')
+  assert(scriptRow && scriptRow.text.includes('#trash'), '前端注入脚本包含 #trash 路由逻辑')
+  assert(scriptRow && scriptRow.text.includes('/api/session-cleaner/preview'), '前端注入脚本包含 preview 端点调用逻辑')
 
-  // 模拟插件卸载
-  if (effectDisposer) effectDisposer();
-  assert(registeredRoutes.size === 0, '插件卸载 disposer 成功清理所有已注册路由');
-  assert(injectListeners.length === 0, '插件卸载后 index-inject 事件监听已全部移除');
+  if (effectDisposer) effectDisposer()
+  assert(registeredRoutes.size === 0, '插件卸载 disposer 成功清理所有已注册路由')
+  assert(injectListeners.length === 0, '插件卸载后 index-inject 事件监听已全部移除')
+
+  // -------------------------------------------------------------------------
+  // Test 7: [v1.1.0 新增] extractSessionPreview 纯函数断言 (明文 .jsonl 提取与过滤)
+  // -------------------------------------------------------------------------
+  console.log('\n[测试 7] extractSessionPreview 明文 .jsonl 提取与过滤测试...')
+  const sampleJsonlPath = join(testRoot, 'sample.jsonl')
+  const jsonlLines = [
+    JSON.stringify({ type: 'session', version: 0, id: 'sess-test-101', createdAt: 1700000000000, cwd: 'C:\\projects\\demo' }),
+    JSON.stringify({ type: 'session/title', data: { title: '初始标题' } }),
+    JSON.stringify({ type: 'session/title', data: { title: '最终覆盖标题' } }),
+    JSON.stringify({ type: 'turn/start', time: 1700000001000, data: { turn: 1 } }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 1700000002000, data: { content: [{ type: 'text', text: '这是首条用户真实指令' }], source: { kind: 'user' }, role: 'user' } }),
+    JSON.stringify({ type: 'user/message', seq: 2, time: 1700000003000, data: { content: [{ type: 'text', text: '这是系统/插件注入的快照信息' }], source: { kind: 'plugin' }, role: 'user' } }),
+    JSON.stringify({ type: 'tool/call', time: 1700000004000 }),
+    JSON.stringify({ type: 'assistant/message', time: 1700000005000, data: { message: { content: [{ type: 'text', text: '这是助手的首次回复' }] } } }),
+    JSON.stringify({ type: 'turn/start', time: 1700000006000, data: { turn: 2 } }),
+    JSON.stringify({ type: 'user/message', seq: 3, time: 1700000007000, data: { content: '这是第二条用户真实指令（字符串格式）', source: { kind: 'user' }, role: 'user' } }),
+    JSON.stringify({ type: 'assistant/message', time: 1700000008000, data: { message: { content: '这是助手的最终回复' } } }),
+  ]
+  await writeText(sampleJsonlPath, jsonlLines.join('\n'), 'utf8')
+
+  const preview = await extractSessionPreview(sampleJsonlPath)
+  assert(preview.ok === true, 'extractSessionPreview 执行成功')
+  assert(preview.title === '最终覆盖标题', '正确解析最新覆盖标题')
+  assert(preview.createdAt === 1700000000000, '正确解析 createdAt')
+  assert(preview.lastActiveAt === 1700000008000, '正确解析 lastActiveAt')
+  assert(preview.cwd === 'C:\\projects\\demo', '正确解析 cwd')
+  assert(preview.turns === 2, '正确统计 turns = 2')
+  assert(preview.userMessages === 2, '【系统消息过滤断言】userMessages = 2 (忽略 kind:plugin 项)')
+  assert(preview.assistantMessages === 2, '正确统计 assistantMessages = 2')
+  assert(preview.toolCalls === 1, '正确统计 toolCalls = 1')
+  assert(preview.firstUserText === '这是首条用户真实指令', '【核心断言】正确提取 firstUserText 为首条用户指令')
+  assert(preview.lastUserText === '这是第二条用户真实指令（字符串格式）', '正确提取 lastUserText')
+  assert(preview.lastAssistantText === '这是助手的最终回复', '正确提取 lastAssistantText')
+
+  // -------------------------------------------------------------------------
+  // Test 8: [v1.1.0 新增] extractSessionPreview 多帧 zstd 解压断言
+  // -------------------------------------------------------------------------
+  console.log('\n[测试 8] extractSessionPreview 多帧 .zstd 解压测试...')
+  if (typeof zstdCompressSync === 'function') {
+    const frame1Text = JSON.stringify({ type: 'session', createdAt: 1710000000000, cwd: 'D:\\zstd\\test' }) + '\n' +
+                       JSON.stringify({ type: 'user/message', data: { content: '第一帧中的首条指令', source: { kind: 'user' } } }) + '\n'
+    const frame2Text = JSON.stringify({ type: 'assistant/message', data: { message: { content: '第二帧中的回复' } } }) + '\n'
+
+    const bufF1 = zstdCompressSync(Buffer.from(frame1Text, 'utf8'))
+    const bufF2 = zstdCompressSync(Buffer.from(frame2Text, 'utf8'))
+    const multiZstdBuf = Buffer.concat([bufF1, bufF2])
+
+    const zstdFilePath = join(testRoot, 'session.jsonl.zstd')
+    await writeText(zstdFilePath, multiZstdBuf)
+
+    const zstdPreview = await extractSessionPreview(zstdFilePath)
+    assert(zstdPreview.ok === true, '多帧 zstd 解压解析成功')
+    assert(zstdPreview.cwd === 'D:\\zstd\\test', 'zstd 解压提取 cwd 正确')
+    assert(zstdPreview.firstUserText === '第一帧中的首条指令', '【多帧跨块断言】成功从第一帧提取 firstUserText')
+    assert(zstdPreview.lastAssistantText === '第二帧中的回复', '【多帧跨块断言】成功从第二帧提取 lastAssistantText')
+  } else {
+    console.log('  - 当前 Node 环境不含 zstdCompressSync，跳过 zstd 测试')
+  }
+
+  // -------------------------------------------------------------------------
+  // Test 9: [v1.1.0 新增] GET /api/session-cleaner/preview 路由 Handler 断言
+  // -------------------------------------------------------------------------
+  console.log('\n[测试 9] GET /api/session-cleaner/preview 路由 Handler 场景测试...')
+  let previewHandler = null
+  const testWs = {
+    register: (route) => {
+      if (route.path === '/api/session-cleaner/preview') previewHandler = route.handler
+      return () => {}
+    },
+  }
+  const testCtx = {
+    logger: { info: () => {} },
+    inject: (deps, cb) => cb({ webServer: testWs, get: () => null, on: () => () => {} }),
+    effect: () => {},
+  }
+  apply(testCtx, { dshHome: testRoot })
+
+  assert(typeof previewHandler === 'function', '预览路由 handler 正确注入')
+
+  class MockResponse {
+    constructor() { this.statusCode = 0; this.headers = {}; this.body = ''; }
+    writeHead(code, headers) { this.statusCode = code; this.headers = headers; }
+    end(str) { this.body = str; }
+  }
+
+  // (a) 缺少 sessionId -> 400
+  const reqMissing = { url: '/api/session-cleaner/preview' }
+  const resMissing = new MockResponse()
+  await previewHandler(reqMissing, resMissing)
+  assert(resMissing.statusCode === 400, '缺少 sessionId 返回 400')
+
+  // (b) 未找到 -> 400
+  const reqNotFound = { url: '/api/session-cleaner/preview?sessionId=session-not-exist-999' }
+  const resNotFound = new MockResponse()
+  await previewHandler(reqNotFound, resNotFound)
+  assert(resNotFound.statusCode === 400, '未找到 sessionId 返回 400')
+
+  // (c) 存在于 sessions 目录
+  await writeText(join(sDir2, 'session.jsonl'), JSON.stringify({ type: 'user/message', data: { content: '单元测试指令-sDir2', source: { kind: 'user' } } }))
+  const reqSessions = { url: `/api/session-cleaner/preview?sessionId=session-dup-2` }
+  const resSessions = new MockResponse()
+  await previewHandler(reqSessions, resSessions)
+  const dataSessions = JSON.parse(resSessions.body || '{}')
+  assert(resSessions.statusCode === 200, '存在会话返回 200')
+  assert(dataSessions.source === 'sessions', '正确标记 source = sessions')
+  assert(dataSessions.preview?.firstUserText === '单元测试指令-sDir2', '正确返回预览字段')
 
   // 清理临时根目录
   try {

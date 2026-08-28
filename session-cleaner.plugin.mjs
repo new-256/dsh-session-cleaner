@@ -1,18 +1,21 @@
 /**
- * session-cleaner.plugin.mjs — DSH 会话回收站与清理管理器宿主插件 (原生 UI 集成版)
+ * session-cleaner.plugin.mjs — DSH 会话回收站与清理管理器宿主插件 (原生 UI 集成版 v1.1.0)
  *
  * 契约与规范：
  * 1. 路由注册：必须使用 handler 属性，形如 ws.register({ kind: 'exact', path: '...', async handler(req, res) { ... } })
- * 2. 页面注入：必须监听 webserver/index-inject 事件，调用 inj.add({ kind: 'script', placement: 'body', text: '...' })
+ * 2. 页面注入：必须监听 webserver/index-inject 事件，调用 table.push({ kind: 'script', placement: 'body', text: '...' })
  * 3. 移入回收站语义：物理目录移至 dsh-home\.session-cleaner-trash\<sessionId>\，清理 workspace.json / projcache
- * 4. 防重名误删：严格提取 React Fiber 的 sessionId，无法确定 ID 时绝不注入删除选项，二次确认展示同名摘要对比
+ * 4. 防重名误删：严格提取 React Fiber 的 sessionId，无法确定 ID 时绝不注入删除选项，二次确认展示同名摘要与首条指令对比
+ * 5. 对话内容预览：支持多帧 zstd 解压与 plain text JSONL 提取（标题/创建/轮次/用户与助手消息/首条指令高亮）
  *
  * @module session-cleaner
  */
 
 import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { zstdDecompressSync } from 'node:zlib'
 
 export const name = 'session-cleaner'
 
@@ -92,10 +95,191 @@ async function writeJsonFile(filePath, data) {
 }
 
 // ---------------------------------------------------------------------------
+// 多帧 zstd 解压与 JSONL 预览提取 (核心解压与提取纯函数)
+// ---------------------------------------------------------------------------
+
+export function decompressMultiFrameZstd(buf) {
+  const chunks = []
+  let p = 0
+  const dictIdSizes = [0, 1, 2, 4]
+  while (p < buf.length) {
+    if (p + 4 > buf.length) break
+    // Magic number: 0xFD2FB528 (Little Endian: 0x28 0xB5 0x2F 0xFD)
+    if (buf[p] !== 0x28 || buf[p + 1] !== 0xb5 || buf[p + 2] !== 0x2f || buf[p + 3] !== 0xfd) {
+      break
+    }
+    const frameStart = p
+    p += 4
+    if (p >= buf.length) break
+    const fhd = buf[p++]
+    const fcsFlag = fhd >> 6
+    const singleSegment = (fhd >> 5) & 1
+    const checksumFlag = (fhd >> 2) & 1
+    const dictIdFlag = fhd & 3
+
+    if (!singleSegment && p < buf.length) p += 1 // Window Descriptor
+    p += dictIdSizes[dictIdFlag] // Dictionary ID
+
+    let fcsSize = 0
+    if (fcsFlag === 0) fcsSize = singleSegment ? 1 : 0
+    else if (fcsFlag === 1) fcsSize = 2
+    else if (fcsFlag === 2) fcsSize = 4
+    else if (fcsFlag === 3) fcsSize = 8
+    p += fcsSize
+
+    while (p + 3 <= buf.length) {
+      const h = buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16)
+      const last = h & 1
+      const blockSize = h >>> 3
+      p += 3 + blockSize
+      if (last) break
+    }
+    if (checksumFlag) p += 4
+
+    const frameBuf = buf.subarray(frameStart, p)
+    const decompressed = zstdDecompressSync(frameBuf)
+    chunks.push(decompressed)
+  }
+
+  if (chunks.length === 0) {
+    return zstdDecompressSync(buf)
+  }
+  return Buffer.concat(chunks)
+}
+
+function parseContentText(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((item) => item && (item.type === 'text' || typeof item.text === 'string'))
+      .map((item) => item.text || '')
+      .filter(Boolean)
+      .join('\n')
+  }
+  return ''
+}
+
+export async function extractSessionPreview(filePath) {
+  const result = {
+    ok: true,
+    title: null,
+    createdAt: null,
+    lastActiveAt: null,
+    cwd: null,
+    turns: 0,
+    userMessages: 0,
+    assistantMessages: 0,
+    toolCalls: 0,
+    firstUserText: null,
+    lastUserText: null,
+    lastAssistantText: null,
+  }
+
+  try {
+    let resolvedPath = filePath
+    if (!existsSync(resolvedPath)) {
+      if (existsSync(join(filePath, 'session.jsonl.zstd'))) {
+        resolvedPath = join(filePath, 'session.jsonl.zstd')
+      } else if (existsSync(join(filePath, 'session.jsonl'))) {
+        resolvedPath = join(filePath, 'session.jsonl')
+      } else if (existsSync(filePath + '.zstd')) {
+        resolvedPath = filePath + '.zstd'
+      } else if (existsSync(filePath + '.jsonl')) {
+        resolvedPath = filePath + '.jsonl'
+      } else {
+        return { ok: false, error: `文件或目录不存在: ${filePath}` }
+      }
+    }
+
+    let fileContent = ''
+    const isZstd = resolvedPath.endsWith('.zstd')
+
+    if (isZstd) {
+      const rawBuf = await readFile(resolvedPath)
+      fileContent = decompressMultiFrameZstd(rawBuf).toString('utf8')
+    } else {
+      fileContent = await readFile(resolvedPath, 'utf8')
+    }
+
+    const lines = fileContent.split('\n')
+    for (const rawLine of lines) {
+      const lineStr = rawLine.trim()
+      if (!lineStr) continue
+
+      let event
+      try {
+        event = JSON.parse(lineStr)
+      } catch {
+        continue
+      }
+
+      if (!event || typeof event !== 'object') continue
+
+      const timeVal = event.time || event.createdAt || event.data?.time
+      if (typeof timeVal === 'number' && timeVal > 0) {
+        if (!result.createdAt) result.createdAt = timeVal
+        result.lastActiveAt = timeVal
+      }
+
+      switch (event.type) {
+        case 'session':
+          if (typeof event.createdAt === 'number') result.createdAt = event.createdAt
+          if (typeof event.cwd === 'string') result.cwd = event.cwd
+          break
+
+        case 'session/title':
+          if (event.data && typeof event.data.title === 'string') {
+            result.title = event.data.title
+          }
+          break
+
+        case 'turn/start':
+          result.turns += 1
+          break
+
+        case 'tool/call':
+          result.toolCalls += 1
+          break
+
+        case 'user/message': {
+          const srcKind = event.data?.source?.kind
+          if (srcKind !== 'user') break // 系统/插件注入消息过滤
+
+          result.userMessages += 1
+          const text = parseContentText(event.data?.content)
+          if (text) {
+            const truncated = text.slice(0, 300)
+            if (result.firstUserText === null) {
+              result.firstUserText = truncated
+            }
+            result.lastUserText = truncated
+          }
+          break
+        }
+
+        case 'assistant/message': {
+          result.assistantMessages += 1
+          const msgObj = event.data?.message || event.data
+          const text = parseContentText(msgObj?.content)
+          if (text) {
+            result.lastAssistantText = text.slice(0, 300)
+          }
+          break
+        }
+      }
+    }
+
+    return result
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 核心清理/恢复逻辑函数 (独立无 Cordis 依赖，接收 dshHome 根路径)
 // ---------------------------------------------------------------------------
 
-export async function listSessions(dshHome, liveSessionsMap = new Map()) {
+export async function listSessions(dshHome) {
   const storagesDir = join(dshHome, 'storages')
   const sessionsDir = join(dshHome, 'sessions')
 
@@ -158,8 +342,8 @@ export async function listSessions(dshHome, liveSessionsMap = new Map()) {
         const isSubagent = Boolean(!sessionId.startsWith('session-') || subagentVal.identity)
         const subagentLabel = subagentVal.identity?.label || null
 
-        const liveInfo = liveSessionsMap.get(sessionId)
-        const isLive = Boolean(liveInfo?.isLive || openStep || (pendingCalls && Object.keys(pendingCalls).length > 0))
+        // 活跃判定只看 projcache openStep/pendingCalls
+        const isLive = Boolean(openStep || (pendingCalls && Object.keys(pendingCalls).length > 0))
 
         foundSessions.push({
           sessionId,
@@ -394,7 +578,7 @@ export async function purgeTrash(dshHome, sessionId, confirm, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// 自包含 HTML 管理界面生成器 (增强 #trash 锚点与恢复说明)
+// 自包含 HTML 管理界面生成器 (增强对话内容预览功能)
 // ---------------------------------------------------------------------------
 
 export function renderManagerHtml() {
@@ -469,7 +653,7 @@ export function renderManagerHtml() {
   <div class="header">
     <div>
       <h1>DSH 会话清理与回收站管理器</h1>
-      <div style="color: var(--subtext); font-size: 13px;">安全清理、防误删重名任务保障、可逆恢复</div>
+      <div style="color: var(--subtext); font-size: 13px;">安全清理、防误删重名任务保障、对话内容预览、可逆恢复</div>
     </div>
     <button class="btn btn-secondary" onclick="loadAll()">🔄 刷新列表</button>
   </div>
@@ -600,7 +784,8 @@ export function renderManagerHtml() {
       );
 
       const tbody = document.getElementById('sessions-tbl');
-      tbody.innerHTML = filtered.map(s => {
+      let html = '';
+      filtered.forEach(s => {
         let badges = '';
         if (s.isLive) badges += '<span class="badge badge-live">活跃运行中</span> ';
         if (s.titleCollision) badges += '<span class="badge badge-collision">同名冲突</span> ';
@@ -611,7 +796,7 @@ export function renderManagerHtml() {
         const shortId = s.sessionId.length > 18 ? s.sessionId.slice(0, 10) + '...' + s.sessionId.slice(-6) : s.sessionId;
         const rowClass = s.titleCollision ? 'collision-row' : '';
 
-        return \`<tr class="\${rowClass}">
+        html += \`<tr class="\${rowClass}">
           <td>\${badges}</td>
           <td><strong>\${escapeHtml(s.title)}</strong>\${s.subagentLabel ? '<br><small style="color:var(--subtext)">' + escapeHtml(s.subagentLabel) + '</small>' : ''}</td>
           <td><span class="sid" title="点击复制完整 ID: \${s.sessionId}" onclick="copyId('\${s.sessionId}')">\${shortId}</span></td>
@@ -619,12 +804,17 @@ export function renderManagerHtml() {
           <td>\${s.turns} 轮 / \${s.steps} 步</td>
           <td>\${formatBytes(s.dirSize)}</td>
           <td>
-            <button class="btn btn-danger" \${s.isLive ? 'disabled title="活跃会话无法删除"' : ''} onclick="openDeleteModal('\${s.sessionId}')">
+            <button class="btn btn-secondary" onclick="togglePreview('\${s.sessionId}', this)">💬 查看对话</button>
+            <button class="btn btn-danger" style="margin-left:6px;" \${s.isLive ? 'disabled title="活跃会话无法删除"' : ''} onclick="openDeleteModal('\${s.sessionId}')">
               \${s.isLive ? '活跃锁定' : '移入回收站'}
             </button>
           </td>
+        </tr>
+        <tr id="prev-row-\${s.sessionId}" style="display:none;">
+          <td colspan="7" id="prev-cell-\${s.sessionId}" style="background:#181825; padding:16px;"></td>
         </tr>\`;
-      }).join('');
+      });
+      tbody.innerHTML = html;
     }
 
     function renderTrash() {
@@ -633,16 +823,92 @@ export function renderManagerHtml() {
         tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--subtext);">回收站为空</td></tr>';
         return;
       }
-      tbody.innerHTML = rawTrash.map(t => \`<tr>
-        <td><strong>\${escapeHtml(t.title)}</strong><br><small style="font-family:monospace; color:var(--subtext)">\${t.sessionId}</small></td>
-        <td>\${escapeHtml(t.originalWorkspacePath || '未知')}</td>
-        <td>\${formatDate(t.deletedAt)}</td>
-        <td>\${formatBytes(t.dirSize)}</td>
-        <td>
-          <button class="btn btn-success" onclick="restoreSession('\${t.sessionId}')">恢复</button>
-          <button class="btn btn-danger" style="margin-left:8px;" onclick="purgeSession('\${t.sessionId}')">彻底清除</button>
-        </td>
-      </tr>\`).join('');
+      let html = '';
+      rawTrash.forEach(t => {
+        html += \`<tr>
+          <td><strong>\${escapeHtml(t.title)}</strong><br><small style="font-family:monospace; color:var(--subtext)">\${t.sessionId}</small></td>
+          <td>\${escapeHtml(t.originalWorkspacePath || '未知')}</td>
+          <td>\${formatDate(t.deletedAt)}</td>
+          <td>\${formatBytes(t.dirSize)}</td>
+          <td>
+            <button class="btn btn-secondary" onclick="togglePreview('\${t.sessionId}', this)">💬 查看对话</button>
+            <button class="btn btn-success" style="margin-left:6px;" onclick="restoreSession('\${t.sessionId}')">恢复</button>
+            <button class="btn btn-danger" style="margin-left:6px;" onclick="purgeSession('\${t.sessionId}')">彻底清除</button>
+          </td>
+        </tr>
+        <tr id="prev-row-\${t.sessionId}" style="display:none;">
+          <td colspan="5" id="prev-cell-\${t.sessionId}" style="background:#181825; padding:16px;"></td>
+        </tr>\`;
+      });
+      tbody.innerHTML = html;
+    }
+
+    async function togglePreview(sessionId, btn) {
+      const prevRow = document.getElementById('prev-row-' + sessionId);
+      const prevCell = document.getElementById('prev-cell-' + sessionId);
+      if (!prevRow || !prevCell) return;
+
+      if (prevRow.style.display !== 'none') {
+        prevRow.style.display = 'none';
+        btn.innerText = '💬 查看对话';
+        return;
+      }
+
+      prevRow.style.display = 'table-row';
+      btn.innerText = '🔼 收起对话';
+      prevCell.innerHTML = '<div style="color:var(--accent);">⏳ 正在解压并读取对话记录...</div>';
+
+      try {
+        const res = await fetch('/api/session-cleaner/preview?sessionId=' + encodeURIComponent(sessionId)).then(r => r.json());
+        if (!res.success || !res.preview) {
+          prevCell.innerHTML = '<div style="color:var(--danger);">⚠️ 无法加载对话预览: ' + escapeHtml(res.error || '未知错误') + '</div>';
+          return;
+        }
+        const p = res.preview;
+        let html = \`
+          <div style="font-size:13px; line-height:1.5; color:var(--text);">
+            <div style="display:flex; gap:16px; margin-bottom:10px; color:var(--subtext); font-size:12px; flex-wrap:wrap;">
+              <span>📅 创建时间: \${formatDate(p.createdAt)}</span>
+              <span>⏱️ 最近活动: \${formatDate(p.lastActiveAt)}</span>
+              <span>📁 工作目录: <code style="color:var(--accent);">\${escapeHtml(p.cwd || '未知')}</code></span>
+            </div>
+            <div style="display:flex; gap:12px; margin-bottom:12px; font-size:12px; background:#21222c; padding:6px 12px; border-radius:6px; flex-wrap:wrap;">
+              <span><strong>\${p.turns}</strong> 轮对话</span> |
+              <span><strong>\${p.userMessages}</strong> 条用户指令</span> |
+              <span><strong>\${p.assistantMessages}</strong> 条助手回复</span> |
+              <span><strong>\${p.toolCalls}</strong> 次工具调用</span>
+            </div>
+        \`;
+
+        if (p.firstUserText) {
+          html += \`
+            <div style="margin-bottom:10px;">
+              <strong style="color:var(--accent); font-size:13px;">💡 首条用户指令 (同名分辨核心)：</strong>
+              <pre style="background:#2b2b3b; border-left:4px solid var(--accent); padding:10px; margin:4px 0 0 0; border-radius:4px; font-family:monospace; white-space:pre-wrap; word-break:break-all; max-height:160px; overflow-y:auto;">\${escapeHtml(p.firstUserText)}</pre>
+            </div>
+          \`;
+        }
+        if (p.lastUserText && p.lastUserText !== p.firstUserText) {
+          html += \`
+            <div style="margin-bottom:10px;">
+              <strong style="color:var(--subtext); font-size:12px;">💬 最近用户指令：</strong>
+              <pre style="background:#2b2b3b; border-left:4px solid var(--subtext); padding:8px; margin:4px 0 0 0; border-radius:4px; font-family:monospace; white-space:pre-wrap; word-break:break-all; max-height:120px; overflow-y:auto;">\${escapeHtml(p.lastUserText)}</pre>
+            </div>
+          \`;
+        }
+        if (p.lastAssistantText) {
+          html += \`
+            <div>
+              <strong style="color:var(--success); font-size:12px;">🤖 最近助手回复：</strong>
+              <pre style="background:#2b2b3b; border-left:4px solid var(--success); padding:8px; margin:4px 0 0 0; border-radius:4px; font-family:monospace; white-space:pre-wrap; word-break:break-all; max-height:120px; overflow-y:auto;">\${escapeHtml(p.lastAssistantText)}</pre>
+            </div>
+          \`;
+        }
+        html += '</div>';
+        prevCell.innerHTML = html;
+      } catch (err) {
+        prevCell.innerHTML = '<div style="color:var(--danger);">⚠️ 请求失败: ' + escapeHtml(err.message) + '</div>';
+      }
     }
 
     function copyId(id) {
@@ -654,16 +920,16 @@ export function renderManagerHtml() {
       return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    function openDeleteModal(sessionId) {
+    async function openDeleteModal(sessionId) {
       const target = rawSessions.find(s => s.sessionId === sessionId);
       if (!target) return;
 
       document.getElementById('modal-target-info').innerHTML = \`
-标题: \${target.title}
+标题: \${escapeHtml(target.title)}
 完整 ID: \${target.sessionId}
 创建时间: \${formatDate(target.createdAt)}
 磁盘大小: \${formatBytes(target.dirSize)}
-工作区: \${target.workspacePath}
+工作区: \${escapeHtml(target.workspacePath)}
       \`;
 
       const warningEl = document.getElementById('modal-collision-warning');
@@ -671,7 +937,7 @@ export function renderManagerHtml() {
         const others = rawSessions.filter(s => s.title === target.title && s.sessionId !== target.sessionId);
         document.getElementById('modal-other-info').innerHTML = others.map(o => \`
 - 另一同名会话 ID: \${o.sessionId}
-  创建时间: \${formatDate(o.createdAt)} | 大小: \${formatBytes(o.dirSize)} | 工作区: \${o.workspacePath}
+  创建时间: \${formatDate(o.createdAt)} | 大小: \${formatBytes(o.dirSize)} | 工作区: \${escapeHtml(o.workspacePath)}
         \`).join('<br>');
         warningEl.style.display = 'block';
       } else {
@@ -775,7 +1041,7 @@ export function apply(ctx, config = {}) {
   const mergedConfig = { ...DEFAULT_CONFIG, ...config }
   const verbose = Boolean(mergedConfig.verbose)
 
-  const dshHome = process.env.DSH_HOME || resolve(process.env.APPDATA || '', 'DSH Desktop/dsh-home')
+  const dshHome = config.dshHome || process.env.DSH_HOME || join(homedir(), '.dsh')
 
   if (verbose) {
     ctx.logger?.info(`[session-cleaner] 启动成功，dshHome: ${dshHome}`)
@@ -788,9 +1054,6 @@ export function apply(ctx, config = {}) {
     if (!ws) return
 
     // 路由 1: GET /api/session-cleaner/sessions
-    // 注：活跃判定只看 projcache 的 openStep/pendingCalls（正在运行的硬信号）。
-    // 不用 SessionStore.get/list —— 后端会把打开过的会话常驻内存，
-    // 那样会把所有空闲会话也误标为"活跃"导致全部拒删。
     disposers.push(
       ws.register({
         kind: 'exact',
@@ -826,6 +1089,84 @@ export function apply(ctx, config = {}) {
       })
     )
 
+    // 路由 3: GET /api/session-cleaner/preview?sessionId=...
+    disposers.push(
+      ws.register({
+        kind: 'exact',
+        path: '/api/session-cleaner/preview',
+        async handler(req, res) {
+          try {
+            const urlObj = new URL(req.url, 'http://localhost')
+            const sessionId = urlObj.searchParams.get('sessionId')
+            if (!sessionId) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ success: false, error: '缺少 sessionId 参数' }))
+              return
+            }
+
+            let targetFile = null
+            let source = null
+
+            // 1. 查找回收站
+            const trashDir = join(dshHome, mergedConfig.trashDirName, sessionId, 'session-data')
+            if (existsSync(trashDir)) {
+              if (existsSync(join(trashDir, 'session.jsonl.zstd'))) {
+                targetFile = join(trashDir, 'session.jsonl.zstd')
+                source = 'trash'
+              } else if (existsSync(join(trashDir, 'session.jsonl'))) {
+                targetFile = join(trashDir, 'session.jsonl')
+                source = 'trash'
+              }
+            }
+
+            // 2. 查找 sessions 目录
+            if (!targetFile) {
+              const sessionsDir = join(dshHome, 'sessions')
+              if (existsSync(sessionsDir)) {
+                let wsFolders = []
+                try {
+                  wsFolders = await readdir(sessionsDir, { withFileTypes: true })
+                } catch {}
+                for (const wsFolder of wsFolders) {
+                  if (!wsFolder.isDirectory()) continue
+                  const candidateDir = join(sessionsDir, wsFolder.name, sessionId)
+                  if (existsSync(candidateDir)) {
+                    if (existsSync(join(candidateDir, 'session.jsonl.zstd'))) {
+                      targetFile = join(candidateDir, 'session.jsonl.zstd')
+                      source = 'sessions'
+                      break
+                    } else if (existsSync(join(candidateDir, 'session.jsonl'))) {
+                      targetFile = join(candidateDir, 'session.jsonl')
+                      source = 'sessions'
+                      break
+                    }
+                  }
+                }
+              }
+            }
+
+            if (!targetFile) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ success: false, error: `未找到 sessionId 为 "${sessionId}" 的会话日志` }))
+              return
+            }
+
+            const preview = await extractSessionPreview(targetFile)
+            if (preview.ok) {
+              res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ success: true, source, preview }))
+            } else {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ success: false, error: preview.error || '解析日志元数据失败' }))
+            }
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+            res.end(JSON.stringify({ success: false, error: err.message }))
+          }
+        },
+      })
+    )
+
     const parsePostJson = (req) =>
       new Promise((resolve, reject) => {
         let body = ''
@@ -840,7 +1181,7 @@ export function apply(ctx, config = {}) {
         req.on('error', reject)
       })
 
-    // 路由 3: POST /api/session-cleaner/delete
+    // 路由 4: POST /api/session-cleaner/delete
     disposers.push(
       ws.register({
         kind: 'exact',
@@ -878,7 +1219,7 @@ export function apply(ctx, config = {}) {
       })
     )
 
-    // 路由 4: POST /api/session-cleaner/restore
+    // 路由 5: POST /api/session-cleaner/restore
     disposers.push(
       ws.register({
         kind: 'exact',
@@ -902,7 +1243,7 @@ export function apply(ctx, config = {}) {
       })
     )
 
-    // 路由 5: POST /api/session-cleaner/purge
+    // 路由 6: POST /api/session-cleaner/purge
     disposers.push(
       ws.register({
         kind: 'exact',
@@ -926,7 +1267,7 @@ export function apply(ctx, config = {}) {
       })
     )
 
-    // 路由 6: GET /session-cleaner (管理页面)
+    // 路由 7: GET /session-cleaner (管理页面)
     disposers.push(
       ws.register({
         kind: 'exact',
@@ -975,15 +1316,21 @@ export function apply(ctx, config = {}) {
               if (document.getElementById('sc-confirm-overlay')) return;
               const modalHtml = \`
                 <div id="sc-confirm-overlay" style="position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.75); display:none; justify-content:center; align-items:center; z-index:99999; backdrop-filter:blur(4px); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-                  <div style="background:#2b2b3b; width:520px; border-radius:12px; padding:24px; color:#cdd6f4; border:1px solid #45475a; box-shadow:0 8px 32px rgba(0,0,0,0.6); max-width:calc(100vw - 32px);">
+                  <div style="background:#2b2b3b; width:540px; border-radius:12px; padding:24px; color:#cdd6f4; border:1px solid #45475a; box-shadow:0 8px 32px rgba(0,0,0,0.6); max-width:calc(100vw - 32px);">
                     <div style="font-size:18px; font-weight:bold; color:#f38ba8; margin-bottom:14px; display:flex; align-items:center; gap:8px;">⚠️ 确认移入回收站</div>
                     <div style="font-size:14px; line-height:1.6;">
                       将把以下会话移入回收站 (可在回收站还原)：
                       <div id="sc-modal-info" style="background:#181825; padding:12px; border-radius:6px; margin:12px 0; font-family:monospace; font-size:13px; white-space:pre-wrap; word-break:break-all;">读取中...</div>
+                      
+                      <div id="sc-modal-preview" style="display:none; background:#21222c; border-left:4px solid #89b4fa; padding:10px 12px; margin:12px 0; border-radius:4px; font-size:13px;">
+                        <strong style="color:#89b4fa;">💡 本会话首条用户指令 (对照摘要)：</strong>
+                        <div id="sc-modal-preview-text" style="margin-top:4px; font-size:12px; font-family:monospace; white-space:pre-wrap; word-break:break-all; max-height:100px; overflow-y:auto; color:#cdd6f4;"></div>
+                      </div>
+
                       <div id="sc-modal-collision" style="display:none; background:rgba(249, 226, 175, 0.15); border-left:4px solid #f9e2af; padding:10px 12px; margin:12px 0; border-radius:4px; font-size:13px;">
                         <strong style="color:#f9e2af;">⚠️ 注意区分：检测到存在同名冲突会话！</strong><br>
                         <span style="font-size:12px; color:#a6adc8;">本操作只删除上方列出的这一个。同名另一会话信息：</span>
-                        <div id="sc-modal-other" style="margin-top:4px; font-size:12px; font-family:monospace;"></div>
+                        <div id="sc-modal-other" style="margin-top:6px; font-size:12px; font-family:monospace;"></div>
                       </div>
                       <div id="sc-modal-msg" style="color:#f38ba8; font-size:13px; margin-top:8px;"></div>
                     </div>
@@ -1013,12 +1360,15 @@ export function apply(ctx, config = {}) {
               ensureModalContainer();
               const overlay = document.getElementById('sc-confirm-overlay');
               const infoEl = document.getElementById('sc-modal-info');
+              const prevBox = document.getElementById('sc-modal-preview');
+              const prevTextEl = document.getElementById('sc-modal-preview-text');
               const collisionEl = document.getElementById('sc-modal-collision');
               const otherEl = document.getElementById('sc-modal-other');
               const msgEl = document.getElementById('sc-modal-msg');
               const confirmBtn = document.getElementById('sc-btn-confirm');
 
               infoEl.innerText = 'Session ID: ' + sessionId + '\\n正在读取元数据...';
+              prevBox.style.display = 'none';
               collisionEl.style.display = 'none';
               msgEl.innerText = '';
               confirmBtn.disabled = false;
@@ -1043,12 +1393,39 @@ export function apply(ctx, config = {}) {
 
                 if (target.titleCollision) {
                   const others = allSessions.filter(s => s.title === target.title && s.sessionId !== target.sessionId);
-                  otherEl.innerText = others.map(o => \`- ID: \${o.sessionId} | 创建: \${new Date(o.createdAt).toLocaleString('zh-CN')} | \${o.turns}轮\`).join('\\n');
+                  otherEl.innerText = '读取同名会话首条指令中...';
                   collisionEl.style.display = 'block';
+
+                  // 异步并发拉取同名对方的 preview (静默降级)
+                  Promise.all(others.map(async o => {
+                    let pText = '';
+                    try {
+                      const pRes = await fetch('/api/session-cleaner/preview?sessionId=' + encodeURIComponent(o.sessionId)).then(r => r.json());
+                      if (pRes.success && pRes.preview && pRes.preview.firstUserText) {
+                        pText = pRes.preview.firstUserText.slice(0, 200);
+                      }
+                    } catch {}
+                    return \`- ID: \${o.sessionId}\\n  创建时间: \${new Date(o.createdAt).toLocaleString('zh-CN')} | \${o.turns}轮\\n  工作区: \${o.workspacePath}\${pText ? '\\n  首条指令: ' + pText : ''}\`;
+                  })).then(listStr => {
+                    otherEl.innerText = listStr.join('\\n\\n');
+                  }).catch(() => {});
                 }
               } else {
                 infoEl.innerText = '完整 ID: ' + sessionId + '\\n(包含日志文件)';
               }
+
+              // 异步加载目标会话的对话预览 (静默降级)
+              try {
+                fetch('/api/session-cleaner/preview?sessionId=' + encodeURIComponent(sessionId))
+                  .then(r => r.json())
+                  .then(pRes => {
+                    if (pRes.success && pRes.preview && pRes.preview.firstUserText) {
+                      prevTextEl.innerText = pRes.preview.firstUserText.slice(0, 200);
+                      prevBox.style.display = 'block';
+                    }
+                  })
+                  .catch(() => {});
+              } catch(e) {}
 
               confirmBtn.onclick = async () => {
                 confirmBtn.disabled = true;
@@ -1211,12 +1588,12 @@ export function apply(ctx, config = {}) {
           } catch(e) {}
         })();
         `
-      };
+      }
 
       if (Array.isArray(table)) {
-        table.push(scriptRow);
+        table.push(scriptRow)
       } else if (table && typeof table.add === 'function') {
-        table.add(scriptRow);
+        table.add(scriptRow)
       }
     })
     if (typeof unbindInject === 'function') disposers.push(unbindInject)

@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-cleaner",
-  "version": "1.0.0",
-  "description": "DSH 会话清理宿主插件：侧边栏原生「移入回收站」+ 回收站管理页 + HTTP API（两级可恢复删除、同名防删错、活跃会话保护）",
+  "version": "1.1.0",
+  "description": "DSH 会话清理宿主插件：侧边栏原生「移入回收站」+ 回收站管理页 + HTTP API + 对话内容预览（两级可恢复删除、同名防删错、多帧 zstd 解压、系统消息过滤、活跃会话保护）",
   "type": "module",
   "private": true,
   "main": "session-cleaner.plugin.mjs",
@@ -17,7 +17,8 @@
     "deepseek-harness",
     "cordis",
     "plugin",
-    "session-management"
+    "session-management",
+    "session-preview"
   ],
   "license": "MIT"
 }
