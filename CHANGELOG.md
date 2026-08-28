@@ -2,6 +2,13 @@
 
 遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号语义化。
 
+## [1.1.1] - 2026-08-28
+
+### 修复
+
+- **「⋯」菜单不出现「移入回收站」**（关键修复）：原 React Fiber 提取只读了 DOM 元素宿主 fiber 的 `memoizedProps`——那只是 DOM 属性（className/onClick 等），组件的 `{node}` props 在 **fiber.return 链**的组件 fiber 上。修复为沿 `fiber.return` 向上遍历（≤12 层）提取 `node.id`，并保留 `__reactProps$` 展开兜底与 DOM 父元素上溯。已针对实际运行版本（dsh 0.1.1-rc.2 的 ui-workspace bundle）逐项核实：`YDXeBa_menuOpen` 行标记、Portal 菜单挂载 `document.body`、`role="menu"`/`button[role="menuitem"]` 结构、zh 文案「归档会话」精确匹配、Escape 关闭监听，全部兼容。
+- 提取逻辑 5 场景验证（宿主 fiber return 链 / props 展开 / 无 fiber 拒猜 / 父元素上溯 / 超深链返回 null）全部通过。
+
 ## [1.1.0] - 2026-08-28
 
 ### 核心新特性

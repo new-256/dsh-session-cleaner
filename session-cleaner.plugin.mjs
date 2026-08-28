@@ -1294,18 +1294,38 @@ export function apply(ctx, config = {}) {
             const SETTINGS_AREA_SELECTORS = ['[class*="_settingsArea"]', '.hHd-Xa_settingsArea'];
             const TRIGGER_SELECTORS = ['[class*="_trigger"]', '.VOzbGW_trigger'];
 
-            // 1. 从 React Fiber 递归提取真实 sessionId (绝不按标题猜)
+            // 1. 从 React Fiber 提取真实 sessionId (绝不按标题猜)
+            // 关键：DOM 元素上的 __reactFiber$ 指向宿主 fiber，其 memoizedProps 只是 DOM 属性
+            // (className/onClick 等)；组件的 {node} props 在 fiber.return 链上的组件 fiber 里。
+            // 必须沿 fiber.return 向上遍历才能拿到 SessionNodeItem 的 node.id。
             function extractSessionIdFromEl(el) {
               if (!el) return null;
               let curr = el;
               for (let depth = 0; depth < 6 && curr; depth++) {
-                const keys = Object.keys(curr);
-                const fiberKey = keys.find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactProps$'));
-                if (fiberKey) {
-                  const val = curr[fiberKey];
-                  const sId = val?.memoizedProps?.node?.id || val?.node?.id || val?.memoizedProps?.session?.id || val?.session?.id;
-                  if (typeof sId === 'string' && sId.trim().length > 0) return sId.trim();
-                }
+                try {
+                  const keys = Object.keys(curr);
+                  const fiberKey = keys.find(k => k.startsWith('__reactFiber$'));
+                  if (fiberKey) {
+                    let fiber = curr[fiberKey];
+                    for (let i = 0; i < 12 && fiber; i++) {
+                      const p = fiber.memoizedProps;
+                      if (p && typeof p === 'object') {
+                        const sId = (p.node && typeof p.node.id === 'string' && p.node.id.trim() && p.node.id)
+                          || (p.session && typeof p.session.id === 'string' && p.session.id.trim() && p.session.id);
+                        if (sId) return sId.trim();
+                      }
+                      fiber = fiber.return;
+                    }
+                  }
+                  // 兜底：组件把 props 展开到 DOM 元素时，__reactProps$ 上直接有 node/session
+                  const propsKey = keys.find(k => k.startsWith('__reactProps$'));
+                  if (propsKey) {
+                    const p = curr[propsKey];
+                    const sId = (p && p.node && typeof p.node.id === 'string' && p.node.id)
+                      || (p && p.session && typeof p.session.id === 'string' && p.session.id);
+                    if (sId && sId.trim()) return sId.trim();
+                  }
+                } catch(e) {}
                 curr = curr.parentElement;
               }
               return null;

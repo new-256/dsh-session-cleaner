@@ -258,6 +258,8 @@ async function runTests() {
   assert(scriptRow && scriptRow.text.includes('_menuOpen'), '前端注入脚本包含 _menuOpen 选择器定义')
   assert(scriptRow && scriptRow.text.includes('#trash'), '前端注入脚本包含 #trash 路由逻辑')
   assert(scriptRow && scriptRow.text.includes('/api/session-cleaner/preview'), '前端注入脚本包含 preview 端点调用逻辑')
+  assert(scriptRow && scriptRow.text.includes('fiber.return'), '【关键修复断言】注入脚本沿 fiber.return 链提取 sessionId（宿主 fiber 的 memoizedProps 不含组件 props）')
+  assert(scriptRow && scriptRow.text.includes('归档会话'), '注入脚本按归档会话菜单项定位会话菜单')
 
   if (effectDisposer) effectDisposer()
   assert(registeredRoutes.size === 0, '插件卸载 disposer 成功清理所有已注册路由')
