@@ -1,6 +1,6 @@
 {
   "name": "@luchenglong/dsh-session-cleaner",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "DSH (DeepSeek Harness) 会话回收站与清理管理器：移入回收站 / 恢复 / 彻底清除、重名防误删、对话内容预览、定期自动清空、主题与 DSH 主体一致。Trash bin & session cleaner for DeepSeek Harness: move-to-trash, restore, purge, name-collision guard, conversation preview, scheduled auto-purge, DSH-native theming.",
   "publishConfig": {
     "access": "public"
