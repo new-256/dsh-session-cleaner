@@ -2,5 +2,6 @@ node_modules/
 .env
 .env.*
 *.log
+*.tgz
 tmp/
 .tmp/
