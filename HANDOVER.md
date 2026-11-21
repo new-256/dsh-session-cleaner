@@ -1,8 +1,8 @@
 # @luchenglong/dsh-session-cleaner 交接文档
 
-> **交接日期**: 2026-10-07
-> **插件版本**: 1.2.1
-> **适配 DSH 版本**: 0.1.7-rc.1（当前）→ 0.2.0-rc.2（升级目标，已兼容）
+> **交接日期**: 2026-10-07（v1.3.0 更新: 2026-11-15）
+> **插件版本**: 1.3.0
+> **适配 DSH 版本**: 0.1.7-rc.1 → 0.2.0-rc.2 → 0.2.2-rc.3（应用内 iframe 遮罩方案实测）
 > **源码位置**: `Desktop\codebuddy-bridge\dsh-session-cleaner`
 > **npm**: https://www.npmjs.com/package/@luchenglong/dsh-session-cleaner
 > **GitHub**: https://github.com/new-256/dsh-session-cleaner

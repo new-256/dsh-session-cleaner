@@ -5,13 +5,17 @@
  *   设置读写 → Session ID 安全校验 → listSessions 归档标记 →
  *   listTrash 过滤（隐藏当前列表条目/保留归档与回收站条目）→ 过期清理 →
  *   移入回收站（含同名残留清理）→ 恢复（普通 + 归档状态还原）→ 彻底清除
+ *   + v1.3.0 静态断言（源码文本）：无 window.open、自建按钮、应用内遮罩、data-row-key 兜底
  *
  * 运行: node smoke-test.mjs
  */
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const projectRoot = dirname(fileURLToPath(import.meta.url))
 
 const mod = await import('./lib/index.mjs')
 const {
@@ -125,6 +129,14 @@ ok('archived restore keeps sessionIds slot', wsAfter2.tables.workspaces.ws1.sess
 await moveToTrash(home, 'session-active-1')
 const pp = await purgeTrash(home, 'session-active-1', 'PURGE')
 ok('purgeTrash single', pp.success && !existsSync(join(trash, 'session-active-1')))
+
+// --- v1.3.0 静态断言：注入脚本形态（读取 lib/index.mjs 源码文本，不做 DOM 运行） ---
+const libSource = readFileSync(join(projectRoot, 'lib', 'index.mjs'), 'utf8')
+ok('v1.3.0 source has zero window.open', (libSource.match(/window\.open/g) || []).length === 0)
+ok('v1.3.0 source has self-built trash entry', libSource.includes('sc-trash-entry'))
+ok('v1.3.0 source has in-app overlay', libSource.includes('sc-trash-overlay'))
+ok('v1.3.0 source has data-row-key fallback', libSource.includes('data-row-key'))
+ok('v1.3.0 source has iframe trash url', libSource.includes('/session-cleaner#trash'))
 
 rmSync(home, { recursive: true, force: true })
 console.log(fail === 0 ? '=== ALL PASS ===' : `=== ${fail} FAILURES ===`)

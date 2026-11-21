@@ -2,6 +2,27 @@
 
 遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号语义化。
 
+## [1.3.0] - 2026-11-15
+
+### 修复
+
+- **回收站按钮点击零反馈（关键修复）**：侧边栏「🗑️ 回收站」入口原用 `window.open('/session-cleaner#trash', '_blank')`
+  新开窗口，而 DSH Desktop 主进程的 `setWindowOpenHandler` 对渲染层新窗请求静默 deny——
+  调用永不报错也永不成功，表现为「按钮点不动」。现改为**应用内 iframe 遮罩层**（`#sc-trash-overlay`）：
+  工具条含标题 / 复制管理页地址 / ✕ 关闭，主体为 `<iframe src="/session-cleaner#trash">`；
+  支持 Esc 关闭、点击遮罩空白处关闭、关闭后焦点归还入口按钮、重复打开幂等复用（不重复创建）。
+  源码中 `window.open` 归零（新增 `smoke-test.mjs` 静态断言守卫）。
+- **入口按钮改为自建 UI**：不再 `cloneNode` 宿主的设置 `trigger` 节点（克隆节点会继承宿主事件与样式，
+  行为不可控），改用纯 `button.sc-trash-entry`，内联样式并用 DSH 变量 fallback；
+  hover 样式一次性注入 `<style id="sc-trash-entry-style">`。
+
+### 变更
+
+- **菜单项 sessionId 提取增加 `data-row-key` 兜底**：React Fiber 提取全部失败时，解析 menuOpen 行上
+  format 为 `session:<id>` 的 `data-row-key` 属性提取 sessionId（解析失败仍返回 null，绝不按标题猜）。
+  用于 DSH 内部结构变化后 fiber 链不可达的场景，提升菜单项注入命中率。
+- `dsh.compatibility.tested` 追加 `0.2.2-rc.3`（应用内遮罩方案在该版本实测通过）。
+
 ## [1.2.1] - 2026-09-09
 
 ### 修复

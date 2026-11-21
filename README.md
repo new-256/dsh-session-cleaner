@@ -12,6 +12,7 @@ name-collision guard, conversation preview, scheduled auto-purge, and DSH-native
 会话行「⋯」菜单：  重命名 / 分叉会话 / 归档会话 / 移入回收站 ← 本插件注入
 侧边栏底部：        …工作区列表… / 🗑️ 回收站 / ⚙️ 设置        ← 本插件注入
 管理页与确认弹窗：  💬 查看对话 · 定期清空设置 · 同名对照      ← v1.2.0 增强
+侧边栏「🗑️ 回收站」： 应用内 iframe 遮罩弹出管理页（不新开窗口） ← v1.3.0 修复
 ```
 
 > 说明 / Note：npm 上另有同名裸包 `dsh-session-cleaner`（fountunt 发布，专注 live store detach）。
@@ -78,7 +79,8 @@ dsh plugin --profile web add <本包路径>
 1. 鼠标悬停侧边栏任一会话 → 点「⋯」→ **移入回收站**
 2. 确认弹窗核对信息（完整 sessionId、首条用户指令；同名会话有黄色警示区列出各自指令对比）→ 确认
 3. 查看对话：管理页 `/session-cleaner` 点「💬 查看对话」行内展开卡片
-4. 后悔了：侧边栏「🗑️ 回收站」（或 `/session-cleaner#trash`）→ 找到该项 → **恢复**
+4. 后悔了：点侧边栏「🗑️ 回收站」→ **应用内 iframe 遮罩**弹出回收站管理页（不再新开窗口）→ 找到该项 → **恢复**
+   - 遮罩工具条提供「复制管理页地址」（`/session-cleaner#trash`）与「✕ 关闭」；Esc 或点遮罩空白处也可关闭
    - 回收站视图只展示回收站与设置，不显示工作区会话；页头「💬 会话列表」按钮可切换回完整管理页
 5. 确定不要了：回收站里**彻底清除**；或交给**定期自动清空**到期自动处理
 
@@ -145,6 +147,11 @@ dsh-home/
 - `isLive` 判定**不能**用 SessionStore 的内存加载状态——DSH 后端会把打开过的会话常驻内存，那样所有空闲会话都会被误判为活跃而全部拒删。本插件只认 projcache 的 `openStep`/`pendingCalls` 硬信号
 - 前端选择器使用 `[class*="..."]` 包含匹配（如 `_menuOpen`），对 CSS Module 前缀变化免疫；DSH 大版本改版 DOM 结构时需重新适配
 - 自动清空是**不可逆**操作：开启后到期条目会被后台任务直接删除；如不希望自动删除请关闭开关
+- **DSH Desktop 的 url-policy 禁止渲染层新开窗口**：主进程 `setWindowOpenHandler` 对所有
+  `window.open` / `target="_blank"` 请求静默 deny（无报错、无提示，表现为「点击零反馈」）。
+  因此回收站管理页一律走**应用内 iframe 遮罩**（`#sc-trash-overlay`），插件源码中不出现 `window.open`，
+  `smoke-test.mjs` 对此有静态断言守卫。若需在浏览器标签里独立打开管理页，可用遮罩工具条的
+  「复制管理页地址」把 `/session-cleaner#trash` 粘贴到地址栏。
 
 ## 开发 / Development
 
@@ -153,7 +160,9 @@ dsh-home/
 - `lib/index.mjs`：单文件宿主插件（`export const name = 'session-cleaner'` + `apply(ctx, config)`）；
   无 client 半边（注入脚本由 `webserver/index-inject` 事件服务端下发）
 - `cordis.patch.yml`：bundle 补丁层（`package.json` 的 `dsh.bundle.patch` 声明）
-- `smoke-test.mjs`：逻辑冒烟测试（25 项断言，临时 dshHome 副本上运行，不触碰真实数据）
+- `smoke-test.mjs`：逻辑冒烟测试（30 项断言，临时 dshHome 副本上运行，不触碰真实数据；
+  其中 5 项为 v1.3.0 注入脚本形态的源码静态断言）
+- `辅助工具/check-injected-script.mjs`：提取 `lib/index.mjs` 模板字符串内注入的前端脚本并校验其 JS 语法
 
 ### 热更新（改代码不用重启 DSH）
 
@@ -163,21 +172,24 @@ DSH 的 ESM 模块缓存不会因文件内容变化而失效。手动放置部�
 ### 测试
 
 ```bash
-node smoke-test.mjs     # 25 项断言：设置读写/安全校验/归档标记/回收站过滤/过期清理/移入/恢复/归档还原/彻底清除
+node smoke-test.mjs     # 30 项断言：设置读写/安全校验/归档标记/回收站过滤/过期清理/移入/恢复/归档还原/彻底清除
+                        # + v1.3.0 源码静态断言（无 window.open / 自建按钮 / 应用内遮罩 / data-row-key / #trash 地址）
 node --check lib/index.mjs
+node --check smoke-test.mjs
+node 辅助工具/check-injected-script.mjs   # 校验模板字符串内注入脚本的 JS 语法
 ```
 
 ## 兼容性 / Compatibility
 
 | 项 | 值 |
 | --- | --- |
-| `@deepseek-ai/dsh` | `>= 0.1.1-rc.2`（测试于 0.1.2-alpha.5） |
-| DSH Desktop | `>= 0.3.15` |
+| `@deepseek-ai/dsh` | `>= 0.1.1-rc.2`（测试于 0.1.2-alpha.5、0.2.2-rc.3） |
+| DSH Desktop | `>= 0.3.15`（应用内 iframe 遮罩方案测试于 0.2.2-rc.3） |
 | Node.js | `>= 20` |
 
 ## 版本 / Version
 
-见 [CHANGELOG.md](CHANGELOG.md)。当前：**v1.2.0**。
+见 [CHANGELOG.md](CHANGELOG.md)。当前：**v1.3.0**。
 
 ## License
 
